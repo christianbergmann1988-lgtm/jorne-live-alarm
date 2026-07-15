@@ -11,19 +11,44 @@ if (!BOT_TOKEN || !CHAT_ID) {
   throw new Error('BOT_TOKEN oder CHAT_ID fehlt.');
 }
 
+async function telegramRequest(method, payload) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+
+  const result = await response.json();
+
+  if (!response.ok || !result.ok) {
+    throw new Error(
+      `Telegram-Fehler bei ${method}: ${JSON.stringify(result)}`
+    );
+  }
+
+  return result.result;
+}
+
 async function readState() {
   try {
     const content = await readFile(STATE_FILE, 'utf8');
     const state = JSON.parse(content);
 
     return {
-      live: Boolean(state.live),
-      messageId: state.messageId ?? null
+      live: typeof state.live === 'boolean' ? state.live : null,
+      messageId: Number.isInteger(state.messageId)
+        ? state.messageId
+        : null
     };
   } catch (error) {
     if (error.code === 'ENOENT') {
       return {
-        live: false,
+        live: null,
         messageId: null
       };
     }
@@ -40,62 +65,59 @@ async function writeState(state) {
   );
 }
 
-async function sendTelegramMessage(text) {
-  const response = await fetch(
-    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        text
-      })
-    }
-  );
+async function sendStatusMessage(isLive) {
+  const text = isLive
+    ? (
+        `🔴 Jorne ist jetzt LIVE auf TikTok!\n\n` +
+        `👉 Direkt zum Live:\n` +
+        `https://www.tiktok.com/@${USERNAME}/live`
+      )
+    : '⚫ Jorne ist aktuell offline.';
 
-  const result = await response.json();
+  const message = await telegramRequest('sendMessage', {
+    chat_id: CHAT_ID,
+    text
+  });
 
-  if (!response.ok || !result.ok) {
-    throw new Error(
-      `Telegram-Nachricht konnte nicht gesendet werden: ${JSON.stringify(result)}`
-    );
-  }
-
-  return result.result.message_id;
+  return message.message_id;
 }
 
-async function deleteTelegramMessage(messageId) {
+async function removePreviousStatus(messageId) {
   if (!messageId) {
-    console.log('Keine gespeicherte Telegram-Nachricht zum Löschen vorhanden.');
     return;
   }
 
-  const response = await fetch(
-    `https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        message_id: messageId
-      })
-    }
-  );
+  try {
+    await telegramRequest('deleteMessage', {
+      chat_id: CHAT_ID,
+      message_id: messageId
+    });
 
-  const result = await response.json();
-
-  if (!response.ok || !result.ok) {
+    console.log('Die vorherige Statusmeldung wurde gelöscht.');
+  } catch (deleteError) {
     console.warn(
-      `Telegram-Nachricht konnte nicht gelöscht werden: ${JSON.stringify(result)}`
+      `Die vorherige Nachricht konnte nicht gelöscht werden: ${deleteError.message}`
     );
-    return;
-  }
 
-  console.log('Die bisherige Live-Nachricht wurde aus Telegram gelöscht.');
+    /*
+     * Sicherheitslösung:
+     * Falls Telegram die alte Nachricht nicht mehr löschen lässt,
+     * wird wenigstens der alte Link entfernt.
+     */
+    try {
+      await telegramRequest('editMessageText', {
+        chat_id: CHAT_ID,
+        message_id: messageId,
+        text: 'ℹ️ Diese ältere Statusmeldung ist nicht mehr aktuell.'
+      });
+
+      console.log('Der Inhalt der alten Statusmeldung wurde entfernt.');
+    } catch (editError) {
+      console.warn(
+        `Die alte Nachricht konnte auch nicht bearbeitet werden: ${editError.message}`
+      );
+    }
+  }
 }
 
 async function main() {
@@ -108,45 +130,35 @@ async function main() {
     `TikTok-Status von @${USERNAME}: ${isLive ? 'LIVE' : 'offline'}`
   );
 
-  let newState;
+  const statusChanged =
+    oldState.live === null || oldState.live !== isLive;
 
-  if (isLive) {
-    if (!oldState.live || !oldState.messageId) {
-      const messageId = await sendTelegramMessage(
-        `🔴 Jorne ist jetzt LIVE auf TikTok!\n\n` +
-        `👉 Direkt zum Live:\n` +
-        `https://www.tiktok.com/@${USERNAME}/live`
-      );
+  /*
+   * Nur bei einem Statuswechsel wird eine neue Nachricht gesendet.
+   * Gleicher Status = keinerlei neue Telegram-Nachricht.
+   */
+  if (!statusChanged && oldState.messageId) {
+    console.log(
+      `Status unverändert: ${isLive ? 'LIVE' : 'offline'}. ` +
+      'Keine neue Telegram-Nachricht erforderlich.'
+    );
 
-      newState = {
-        live: true,
-        messageId
-      };
-
-      console.log(
-        `Telegram-Nachricht wurde gesendet und mit der ID ${messageId} gespeichert.`
-      );
-    } else {
-      newState = oldState;
-      console.log(
-        'Jorne war bereits als LIVE gespeichert. Keine weitere Nachricht gesendet.'
-      );
-    }
-  } else {
-    if (oldState.live) {
-      await deleteTelegramMessage(oldState.messageId);
-    } else {
-      console.log('Jorne war bereits als offline gespeichert.');
-    }
-
-    newState = {
-      live: false,
-      messageId: null
-    };
+    return;
   }
 
-  await writeState(newState);
-  console.log('Neuer Status wurde in state.json gespeichert.');
+  await removePreviousStatus(oldState.messageId);
+
+  const newMessageId = await sendStatusMessage(isLive);
+
+  await writeState({
+    live: isLive,
+    messageId: newMessageId
+  });
+
+  console.log(
+    `Neue ${isLive ? 'Live-' : 'Offline-'}Meldung wurde ` +
+    `mit der ID ${newMessageId} gespeichert.`
+  );
 }
 
 main().catch((error) => {
