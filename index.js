@@ -48,7 +48,7 @@ async function sendTelegramMessage(text) {
 
 async function main() {
   const oldState = await readState();
-  const connection = new TikTokLiveConnection(USERNAME);
+  const connection = new TikTokLiveConnection(USERNAME, {});
 
   const isLive = await connection.fetchIsLive();
 
