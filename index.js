@@ -97,11 +97,55 @@ async function deleteLiveMessage(messageId) {
   }
 }
 
+function withTimeout(promise, milliseconds) {
+  let timeout;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error(
+        `TikTok antwortet nach ${milliseconds / 1000} Sekunden nicht.`
+      );
+      error.name = 'TimeoutError';
+      reject(error);
+    }, milliseconds);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timeout);
+  });
+}
+
 async function main() {
   const oldState = await readState();
 
   const connection = new TikTokLiveConnection(USERNAME, {});
-  const isLive = await connection.fetchIsLive();
+
+  let isLive;
+
+  try {
+    console.log(`Prüfe TikTok-Status von @${USERNAME} ...`);
+
+    isLive = await withTimeout(
+      connection.fetchIsLive(),
+      20000
+    );
+  } catch (error) {
+    if (error.name === 'TimeoutError') {
+      console.warn(error.message);
+      console.warn(
+        'Dieser Durchlauf wird beendet. Der nächste Check versucht es erneut.'
+      );
+      return;
+    }
+
+    throw error;
+  } finally {
+    try {
+      await connection.disconnect();
+    } catch {
+      // Keine aktive Verbindung vorhanden.
+    }
+  }
 
   console.log(
     `TikTok-Status von @${USERNAME}: ${isLive ? 'LIVE' : 'offline'}`
@@ -149,7 +193,12 @@ async function main() {
   );
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+main()
+  .then(() => {
+    console.log('✅ Live-Check abgeschlossen.');
+    process.exit(0);
+  })
+  .catch((error) => {
+    console.error('❌ Live-Check fehlgeschlagen:', error);
+    process.exit(1);
+  });
